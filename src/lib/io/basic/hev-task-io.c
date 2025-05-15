@@ -28,6 +28,216 @@
 #include "lib/misc/hev-compiler.h"
 
 #include "hev-task-io.h"
+#include "lib/log/hev-task-logger.h"
+
+#include <stdio.h>
+#include <time.h>
+#include <stdint.h>
+#include <math.h>
+#include <string.h>
+#include <pthread.h>
+#include <unistd.h>
+
+// 互斥锁保证线程安全
+static pthread_mutex_t bandwidth_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// 全局静态带宽监测器
+static struct {
+    // 上传相关状态
+    uint64_t total_upload;
+    uint64_t last_total_upload;
+    time_t last_upload_time;
+    double current_upload_rate;
+    char formatted_upload[32];
+
+    // 下载相关状态
+    uint64_t total_download;
+    uint64_t last_total_download;
+    time_t last_download_time;
+    double current_download_rate;
+    char formatted_download[32];
+
+    // 线程控制
+    volatile int running;
+} bandwidth_monitor;
+
+// 监控线程函数
+void* monitor_thread(void* arg) {
+    (void)arg; // 避免未使用参数警告
+
+    while(1) {
+        pthread_mutex_lock(&bandwidth_mutex);
+        const int running = bandwidth_monitor.running;
+        pthread_mutex_unlock(&bandwidth_mutex);
+
+        if (running) {
+            // 获取当前速率
+            const char* upload = hev_task_io_bandwidth_get_formatted_upload();
+            const char* download = hev_task_io_bandwidth_get_formatted_download();
+
+            // 打印速率信息
+            const time_t now = time(NULL);
+            HEV_TASK_LOG_I("[%ld] Upload: %s, Download: %s\n", now, upload, download);
+        }
+
+        // 每秒一次
+        sleep(1);
+    }
+
+    return NULL;
+}
+
+// 初始化带宽监测器
+void hev_task_io_bandwidth_init() {
+    HEV_TASK_LOG_I ("init bandwidth monitor");
+
+    pthread_mutex_lock(&bandwidth_mutex);
+    // 上传初始化
+    bandwidth_monitor.total_upload = 0;
+    bandwidth_monitor.last_upload_time = time(NULL);
+    bandwidth_monitor.current_upload_rate = 0.0;
+    strcpy(bandwidth_monitor.formatted_upload, "0.00 B/s");
+
+    // 下载初始化
+    bandwidth_monitor.total_download = 0;
+    bandwidth_monitor.last_download_time = time(NULL);
+    bandwidth_monitor.current_download_rate = 0.0;
+    strcpy(bandwidth_monitor.formatted_download, "0.00 B/s");
+
+    // pthread_t monitor_tid;
+    // // 创建监控线程
+    // if (pthread_create(&monitor_tid, NULL, monitor_thread, NULL) != 0) {
+    //     HEV_TASK_LOG_E ("Failed to create monitor thread");
+    //     return;
+    // }
+
+    bandwidth_monitor.running = 1;
+
+    pthread_mutex_unlock(&bandwidth_mutex);
+}
+
+// 停止监控
+void hev_task_io_bandwidth_stop() {
+    pthread_mutex_lock(&bandwidth_mutex);
+    bandwidth_monitor.running = 0;
+    pthread_mutex_unlock(&bandwidth_mutex);
+}
+
+// 内部：格式化速率显示
+static void hev_task_io_format_rate(const double rate, char* buffer, size_t size) {
+    const char* unit = "B/s";
+    double display = rate;
+
+    if (rate > 1024 * 1024) {
+        display = rate / (1024 * 1024);
+        unit = "MB/s";
+    } else if (rate > 1024) {
+        display = rate / 1024;
+        unit = "KB/s";
+    }
+
+    snprintf(buffer, size, "%.2f %s", round(display * 100)/100, unit);
+}
+
+// 更新上传数据（传入新增字节数）
+void hev_task_io_bandwidth_add_upload(const uint64_t bytes_added) {
+    pthread_mutex_lock(&bandwidth_mutex);
+
+    bandwidth_monitor.total_upload += bytes_added;
+
+    const time_t now = time(NULL);
+    const double time_diff = difftime(now, bandwidth_monitor.last_upload_time);
+
+    if (time_diff >= 1.0) { // 至少1秒后计算
+        const uint64_t bytes_diff = bandwidth_monitor.total_upload -
+                                    bandwidth_monitor.last_total_upload;
+        bandwidth_monitor.current_upload_rate =
+            (double)bytes_diff / time_diff;
+
+        hev_task_io_format_rate(bandwidth_monitor.current_upload_rate,
+                   bandwidth_monitor.formatted_upload,
+                   sizeof(bandwidth_monitor.formatted_upload));
+
+        bandwidth_monitor.last_total_upload = bandwidth_monitor.total_upload;
+        bandwidth_monitor.last_upload_time = now;
+    }
+
+    pthread_mutex_unlock(&bandwidth_mutex);
+}
+
+// 更新下载数据（传入新增字节数）
+void hev_task_io_bandwidth_add_download(const uint64_t bytes_added) {
+    pthread_mutex_lock(&bandwidth_mutex);
+
+    bandwidth_monitor.total_download += bytes_added;
+
+    const time_t now = time(NULL);
+    const double time_diff = difftime(now, bandwidth_monitor.last_download_time);
+
+    if (time_diff >= 1.0) { // 至少1秒后计算
+        const uint64_t bytes_diff = bandwidth_monitor.total_download -
+                                    bandwidth_monitor.last_total_download;
+        bandwidth_monitor.current_download_rate =
+            (double)bytes_diff / time_diff;
+
+        hev_task_io_format_rate(bandwidth_monitor.current_download_rate,
+                   bandwidth_monitor.formatted_download,
+                   sizeof(bandwidth_monitor.formatted_download));
+
+        bandwidth_monitor.last_total_download = bandwidth_monitor.total_download;
+        bandwidth_monitor.last_download_time = now;
+    }
+
+    pthread_mutex_unlock(&bandwidth_mutex);
+}
+
+void hev_task_io_bandwidth_add(const uint64_t bytes_count, char* name, char* action)
+{
+    if (0 == strcmp (name, "client")) {
+        if (0 == strcmp (action, "read")) {
+            hev_task_io_bandwidth_add_upload (bytes_count);
+        } else {
+            hev_task_io_bandwidth_add_download (bytes_count);
+        }
+    }
+    else if (0 == strcmp (name, "target")) {
+        if (0 == strcmp (action, "read")) {
+            hev_task_io_bandwidth_add_download (bytes_count);
+        } else {
+            hev_task_io_bandwidth_add_upload (bytes_count);
+        }
+    }
+}
+
+// 获取当前上传速率(B/s)
+double hev_task_io_bandwidth_get_upload_rate() {
+    return bandwidth_monitor.current_upload_rate;
+}
+
+// 获取当前下载速率(B/s)
+double hev_task_io_bandwidth_get_download_rate() {
+    return bandwidth_monitor.current_download_rate;
+}
+
+// 获取格式化上传速率
+EXPORT_SYMBOL const char* hev_task_io_bandwidth_get_formatted_upload() {
+    return bandwidth_monitor.formatted_upload;
+}
+
+// 获取格式化下载速率
+EXPORT_SYMBOL const char* hev_task_io_bandwidth_get_formatted_download() {
+    return bandwidth_monitor.formatted_download;
+}
+
+// 获取总上传字节数
+uint64_t hev_task_io_bandwidth_get_total_upload() {
+    return bandwidth_monitor.total_upload;
+}
+
+// 获取总下载字节数
+uint64_t hev_task_io_bandwidth_get_total_download() {
+    return bandwidth_monitor.total_download;
+}
 
 typedef struct _HevTaskIOSplicer HevTaskIOSplicer;
 
@@ -40,6 +250,7 @@ struct _HevTaskIOSplicer
 #else
     HevCircularBuffer *buf;
 #endif /* !ENABLE_IO_SPLICE_SYSCALL */
+    char* name;
 };
 
 EXPORT_SYMBOL int
@@ -208,7 +419,7 @@ retry:
 #ifdef ENABLE_IO_SPLICE_SYSCALL
 
 static int
-task_io_splicer_init (HevTaskIOSplicer *self, size_t buf_size)
+task_io_splicer_init (HevTaskIOSplicer *self, size_t buf_size, char* name)
 {
     HevTask *task = hev_task_self ();
     int res;
@@ -229,6 +440,7 @@ task_io_splicer_init (HevTaskIOSplicer *self, size_t buf_size)
     buf_size = fcntl (self->fd[0], F_GETPIPE_SZ);
 #endif
 
+    self->name = name;
     self->wlen = 0;
     self->blen = buf_size;
 
@@ -286,8 +498,9 @@ task_io_splice (HevTaskIOSplicer *self, int fd_in, int fd_out)
 #else
 
 static int
-task_io_splicer_init (HevTaskIOSplicer *self, size_t buf_size)
+task_io_splicer_init (HevTaskIOSplicer *self, size_t buf_size, char* name)
 {
+    self->name = name;
     self->buf = hev_circular_buffer_new (buf_size);
     if (!self->buf)
         return -1;
@@ -309,6 +522,7 @@ task_io_splice (HevTaskIOSplicer *self, int fd_in, int fd_out)
     int res = 1, iovc;
 
     iovc = hev_circular_buffer_writing (self->buf, iov);
+    //HEV_TASK_LOG_I ("task_io_splice hev_circular_buffer_writing %d", iovc);
     if (iovc) {
         ssize_t s = readv (fd_in, iov, iovc);
         if (0 >= s) {
@@ -317,11 +531,14 @@ task_io_splice (HevTaskIOSplicer *self, int fd_in, int fd_out)
             else
                 res = -1;
         } else {
+            //HEV_TASK_LOG_I ("task_io_splice received %zd bytes\n", s);
+            //hev_task_io_bandwidth_add_download (s);
             hev_circular_buffer_write_finish (self->buf, s);
         }
     }
 
     iovc = hev_circular_buffer_reading (self->buf, iov);
+    //HEV_TASK_LOG_I ("task_io_splice hev_circular_buffer_reading %d", iovc);
     if (iovc) {
         ssize_t s = writev (fd_out, iov, iovc);
         if (0 >= s) {
@@ -330,6 +547,8 @@ task_io_splice (HevTaskIOSplicer *self, int fd_in, int fd_out)
             else
                 res = -1;
         } else {
+            //HEV_TASK_LOG_I ("task_io_splice written %zd bytes to %s\n", s, self->name);
+            hev_task_io_bandwidth_add (s, self->name, "write");
             res = 1;
             hev_circular_buffer_read_finish (self->buf, s);
         }
@@ -350,9 +569,11 @@ hev_task_io_splice (int fd_a_i, int fd_a_o, int fd_b_i, int fd_b_o,
     int res_f = 1;
     int res_b = 1;
 
-    if (task_io_splicer_init (&splicer_f, buf_size) < 0)
+    HEV_TASK_LOG_I ("hev_task_io_splice init");
+
+    if (task_io_splicer_init (&splicer_f, buf_size, "target") < 0)
         return;
-    if (task_io_splicer_init (&splicer_b, buf_size) < 0)
+    if (task_io_splicer_init (&splicer_b, buf_size, "client") < 0)
         goto exit;
 
     for (;;) {

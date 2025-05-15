@@ -17,6 +17,12 @@
 extern "C" {
 #endif
 
+void hev_task_io_bandwidth_init();
+
+const char *hev_task_io_bandwidth_get_formatted_upload();
+
+const char *hev_task_io_bandwidth_get_formatted_download();
+
 typedef int (*HevTaskIOYielder) (HevTaskYieldType type, void *data);
 
 /**
